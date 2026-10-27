@@ -16,8 +16,8 @@ would couple us to Claude's internal storage format and naming, where a
 mismatch is a hard "logged out" failure instead of a harmless stale entry.
 
 Sharing: by default the user's ``settings.json``, ``keybindings.json``,
-``CLAUDE.md``, ``skills/``, ``commands/``, and ``agents/`` follow them into
-the session profile — symlinks on macOS/Linux (Claude's settings writer
+``CLAUDE.md``, ``skills/``, ``commands/``, ``agents/``, and ``rules/`` follow
+them into the session profile — symlinks on macOS/Linux (Claude's settings writer
 detects symlinks and writes through to the target, so in-session ``/config``
 changes land in ``~/.claude``), copies re-synced on every launch on Windows.
 A manifest records what cswap created so removal never touches user data.
@@ -42,7 +42,6 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import unicodedata
 from pathlib import Path
@@ -55,13 +54,12 @@ from claude_swap.exceptions import (
     CredentialReadError,
     SessionError,
 )
-from claude_swap.fsutil import replace_with_retry
+from claude_swap.fsutil import atomic_write_text
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
-from claude_swap.oauth import refresh_oauth_credentials
 from claude_swap.paths import get_default_global_config_path
 from claude_swap.printer import accent, dimmed, muted, warning
-from claude_swap.process_detection import ClaudeSession, list_sessions
+from claude_swap.process_detection import ClaudeSession, scan_sessions
 from claude_swap.settings import atomic_write_json
 
 if TYPE_CHECKING:
@@ -81,6 +79,7 @@ SHARED_ITEMS = (
     "skills",
     "commands",
     "agents",
+    "rules",
 )
 
 # Conversation-history items linked additionally under --share-history.
@@ -113,12 +112,76 @@ MCP_MIRROR_MARKER = ".cswap-mcp-mirror-v1"
 MCP_DISPLACED_STASH = ".cswap-mcp-displaced.json"
 
 
-def mark_session_stale(session_dir: Path) -> None:
-    """Flag a live session profile for re-bootstrap once it exits."""
+def stale_marker_for(session_dir: Path) -> Path:
+    """Where a profile's stale marker is WRITTEN: a SIBLING of the profile dir.
+
+    Not a child. One of the two writers is the fallback for a session-dir
+    invalidation that just failed, and the faults it exists for — EACCES on
+    the session dir, a read-only mount — are faults on that same directory.
+    A child marker therefore asks the very directory that denied the unlink
+    to accept a create; it refuses, ``mark_session_stale`` swallows the
+    OSError, and the profile goes on serving a superseded token with nothing
+    recording it. The parent (``<backup>/sessions/``) is ours and is not what
+    a per-profile EACCES denied.
+
+    Sibling of the DIR, so ``purge``'s ``iterdir()`` (dirs only) and
+    ``_delete_session_profile``'s ``rmtree`` both still see what they expect.
+    """
+    return session_dir.parent / f".{session_dir.name}{STALE_MARKER}"
+
+
+def is_session_stale(session_dir: Path) -> bool:
+    """Whether a profile is flagged for re-bootstrap.
+
+    Both locations: the child path is where the marker used to live, and a
+    profile marked by an older cswap on this machine has a pending
+    re-bootstrap that the move must not drop. Read, never written.
+    """
+    return (
+        stale_marker_for(session_dir).exists()
+        or (session_dir / STALE_MARKER).exists()
+    )
+
+
+def clear_session_stale(session_dir: Path) -> bool:
+    """Drop a profile's stale flag from both marker locations.
+
+    Both are unlinked under their own ``try/except OSError``, not just
+    ``missing_ok=True``: that only covers ENOENT, not EACCES/EROFS, and a
+    caller that just tolerated a denied dir (``_delete_session_profile``'s
+    ``rmtree(ignore_errors=True)``) runs into the same denial again here --
+    on the sibling location (``stale_marker_for``, a denied PARENT) as much
+    as the legacy CHILD location. Each unlink still runs first, so the
+    happy-path removal is unaffected.
+
+    Returns whether every marker is gone, the way ``mark_session_stale``
+    reports its own landing. Tolerating the fault is right; reporting a
+    removal that did not happen is not -- the caller logs the profile as
+    removed while a marker survives, and the next run's stale arm re-fires
+    on it forever, POSTing a refresh grant each time.
+    """
+    cleared = True
+    for marker in (stale_marker_for(session_dir), session_dir / STALE_MARKER):
+        try:
+            marker.unlink(missing_ok=True)
+        except OSError:
+            cleared = False
+    return cleared
+
+
+def mark_session_stale(session_dir: Path) -> bool:
+    """Flag a live session profile for re-bootstrap once it exits.
+
+    Returns whether the marker landed. It can still fail — a read-only mount
+    denies the sibling as surely as the child — and the caller that reaches
+    here BECAUSE an invalidation failed has no other record of it, so the
+    answer is reported rather than swallowed.
+    """
     try:
-        (session_dir / STALE_MARKER).touch()
+        stale_marker_for(session_dir).touch()
+        return True
     except OSError:
-        pass  # best-effort; worst case the old reuse behavior applies
+        return False
 
 # Env vars that make claude bypass account OAuth entirely (verified against
 # claude 2.1.175). Dropped from the auth-status probe (they'd fake "logged in"
@@ -242,19 +305,92 @@ def _may_have_credential_material(session_dir: Path) -> bool:
         pass  # no readable seed — the keychain may still hold the material
     if Platform.detect() != Platform.MACOS:
         return False
-    try:
-        material = macos_keychain.get_password(
-            keychain_service_name(session_dir), _keychain_account_name()
-        )
-    except macos_keychain.KEYCHAIN_ERRORS:
-        return True  # unreadable is not absent: preserve the profile
-    return material is not None
+    for service in _keychain_services(str(session_dir)):
+        try:
+            material = macos_keychain.get_password(service, _keychain_account_name())
+        except macos_keychain.KEYCHAIN_ERRORS:
+            return True  # unreadable is not absent: preserve the profile
+        if material is not None:
+            return True
+    return False
+
+
+def _artifacts_say_usable(session_dir: Path, email: str, org_uuid: str) -> bool:
+    """What local artifacts can say about a profile without running the probe.
+
+    Upstream's probe-timeout fallback (#224 follow-up), lifted to a function
+    because two callers ask it and a copy in each is how they drift apart: the
+    REUSE check (`_is_session_valid`) and the post-bootstrap check, which must
+    not fail a launch over a probe that merely did not answer.
+
+    Deliberately NOT consulted for "unreachable". There the question is
+    whether `claude` can be run at all, and no file on disk answers it.
+    """
+    return _may_have_credential_material(session_dir) and (
+        not session_identity_drifted(session_dir, email, org_uuid)
+    )
 
 
 # Bounded retry for the strict capture read, mirroring the active store's
 # (credentials._ACTIVE_READ_ATTEMPTS / _ACTIVE_READ_RETRY_DELAY).
 _STRICT_KEYCHAIN_ATTEMPTS = 2
 _STRICT_KEYCHAIN_RETRY_DELAY = 0.3  # seconds between attempts
+
+
+def _keychain_services(config_dir: str, override: str | None = None) -> list[str]:
+    """Keychain service names that may hold a profile's credential, in
+    lookup order.
+
+    Claude hashes the exported ``CLAUDE_CONFIG_DIR`` verbatim, so a profile
+    that is a symlink was launched under one of two names: its own path, or
+    the target's, when a tool launches claude at the target directly and
+    keeps the per-account symlink as its bookkeeping (a lease). Reading only
+    the link's name would miss every rotation claude wrote under the
+    target's and serve the plaintext seed left behind, which is how a leased
+    profile's usage silently froze at the last pre-rotation measurement. The
+    profile's own name is tried first, then the target's. A relative target
+    is joined onto the link's parent and tried in two spellings, likeliest
+    first: the lexical form with ``..`` collapsed (``/x/space``, what a tool
+    launching at the target usually exports), offered only when it names the
+    link's own directory — under a parent that is itself a symlink elsewhere
+    it can name an unrelated directory with its own entry — and then the raw
+    join (``/x/sessions/../space``, what ``$(dirname link)/$(readlink link)``
+    exports). ``override`` names the unsuffixed default-profile item and
+    stands alone.
+    """
+    if override is not None:
+        return [override]
+    services = [keychain_service_name(config_dir)]
+    try:
+        target = os.readlink(config_dir)
+    except OSError:
+        return services
+    if os.path.isabs(target):
+        services.append(keychain_service_name(target))
+        return services
+    raw = os.path.join(os.path.dirname(config_dir), target)
+    lexical = os.path.normpath(raw)
+    try:
+        if lexical != raw and os.path.samefile(lexical, raw):
+            services.append(keychain_service_name(lexical))
+    except OSError:
+        pass  # nothing at the lexical path: not a spelling of this directory
+    services.append(keychain_service_name(raw))
+    return services
+
+
+def _keychain_entry(service: str, strict: bool) -> str | None:
+    """One service's item, or ``None`` when absent (rc 44). An unreadable
+    keychain is retried once under ``strict`` and then raised as it stands."""
+    attempts = _STRICT_KEYCHAIN_ATTEMPTS if strict else 1
+    while True:
+        try:
+            return macos_keychain.get_password(service, _keychain_account_name())
+        except macos_keychain.KEYCHAIN_ERRORS:
+            attempts -= 1
+            if not attempts:
+                raise
+            time.sleep(_STRICT_KEYCHAIN_RETRY_DELAY)
 
 
 def read_config_dir_credentials(
@@ -281,23 +417,20 @@ def read_config_dir_credentials(
     The seed may predate an in-profile ``/login``, and capturing it would file
     one account's email against another's token — the very mismatch the capture
     path exists to prevent. An *absent* entry (rc 44) still falls back either
-    way: absence is claude's own signal to read the file.
+    way: absence is claude's own signal to read the file. For a symlinked
+    profile that fallback includes the target's entry under both modes, on
+    purpose: it is the newest generation claude wrote for that directory,
+    and the seed it would otherwise capture is the one claude stopped
+    updating when it first wrote the keychain.
     """
     directory = Path(config_dir)
     if not directory.is_dir():
         return None
     if Platform.detect() == Platform.MACOS:
-        attempts = _STRICT_KEYCHAIN_ATTEMPTS if strict_keychain else 1
-        for attempt in range(attempts):
+        for service in _keychain_services(config_dir, keychain_service):
             try:
-                creds = macos_keychain.get_password(
-                    keychain_service or keychain_service_name(config_dir),
-                    _keychain_account_name(),
-                )
+                creds = _keychain_entry(service, strict_keychain)
             except macos_keychain.KEYCHAIN_ERRORS as e:
-                if attempt + 1 < attempts:
-                    time.sleep(_STRICT_KEYCHAIN_RETRY_DELAY)
-                    continue
                 if strict_keychain:
                     raise CredentialReadError(
                         f"Keychain entry for profile {config_dir} is unreadable "
@@ -306,7 +439,7 @@ def read_config_dir_credentials(
                 break  # best-effort read: the plaintext seed is the next-best truth
             if creds:
                 return creds
-            break  # entry absent (rc 44) — claude's own signal to read the file
+            # entry absent (rc 44) — claude's own signal to look further
     try:
         return (directory / ".credentials.json").read_text(encoding="utf-8")
     except (OSError, ValueError):
@@ -353,7 +486,10 @@ def session_identity_drifted(session_dir: Path, email: str, org_uuid: str) -> bo
     ``_is_session_valid``: the email must match, the org only when both sides
     have a value. An unreadable identity is NOT drift — missing metadata
     degrades to trusting the profile (its token family is normally the slot's
-    freshest) rather than abandoning it over a broken ``.claude.json``.
+    freshest) rather than abandoning it over a broken ``.claude.json``. That
+    is a read-side policy: ``_adopt_session_credential``, which writes the
+    profile's credential into the backup, requires ``read_session_identity``
+    to succeed on top of this.
     """
     identity = read_session_identity(session_dir)
     if identity is None:
@@ -364,11 +500,30 @@ def session_identity_drifted(session_dir: Path, email: str, org_uuid: str) -> bo
     return bool(profile_org and org_uuid and profile_org != org_uuid)
 
 
-def live_sessions_for(session_dir: Path) -> list[ClaudeSession]:
-    """Live Claude instances running against a session profile."""
+def scan_live_sessions(session_dir: Path) -> tuple[list[ClaudeSession], int]:
+    """Live Claude instances for a profile, and records that could not be read.
+
+    Every caller of this gates a destructive step, so the unreadable count
+    travels with the list: a record we could not read is not evidence that
+    nothing is running. Renamed from ``live_sessions_for`` deliberately -- the
+    old name returned a bare list, and a call site left on it would read a
+    tuple as unconditionally truthy.
+    """
     if not session_dir.exists():
-        return []
-    return list_sessions(claude_dir=session_dir)
+        return [], 0
+    return scan_sessions(claude_dir=session_dir)
+
+
+def profile_is_quiescent(session_dir: Path) -> bool:
+    """Nothing is running against this profile, AND we could read every record.
+
+    The predicate every "is it safe to rewrite/remove this profile" site
+    wants. False when a record is unreadable: not knowing is not the same as
+    knowing nothing is there, and the step behind these callers cannot be
+    undone.
+    """
+    sessions, unreadable = scan_live_sessions(session_dir)
+    return not sessions and unreadable == 0
 
 
 def _mkdir_private(path: Path) -> None:
@@ -409,8 +564,16 @@ class SessionManager:
         claude_args: list[str],
         share: bool = True,
         share_history: bool = False,
+        require_session: bool = False,
     ) -> NoReturn:
-        """Launch Claude Code as the given account in the current terminal."""
+        """Launch Claude Code as the given account in the current terminal.
+
+        ``require_session`` turns the same-account fast path (a plain claude
+        launch on the default login) into a refusal: a wrapper that hands a
+        terminal to one account per session needs the isolation guaranteed,
+        and a session on the default login is the one thing an account
+        switch can later pull out from under it.
+        """
         claude_bin = shutil.which("claude")
         if not claude_bin:
             raise SessionError(
@@ -444,6 +607,15 @@ class SessionManager:
             # refresh token.
             current = self.switcher._get_current_account()
             if current is not None and current == (email, org_uuid):
+                if require_session:
+                    raise SessionError(
+                        f"Account-{account_num} ({email}) is the active default "
+                        "login, so this launch would run plain claude on the "
+                        "default login rather than in a session profile (a "
+                        "second copy of the active credential would drift). "
+                        "Switch the default login to another account first, "
+                        "or run `claude` directly."
+                    )
                 print(
                     dimmed(
                         f"Account-{account_num} ({email}) is already the active "
@@ -543,9 +715,7 @@ class SessionManager:
         # pass the local reuse check. Honored only when no session is live —
         # a second `cswap run` joining a live session must not invalidate
         # under the running claude (the marker survives for later).
-        stale = (session_dir / STALE_MARKER).exists() and not live_sessions_for(
-            session_dir
-        )
+        stale = is_session_stale(session_dir) and profile_is_quiescent(session_dir)
 
         # Cheap reuse check without the lock: most launches hit this.
         if not stale and self._is_session_valid(session_dir, email, org_uuid):
@@ -553,15 +723,105 @@ class SessionManager:
                 self._sync_sharing(session_dir, share, share_history)
             return session_dir, account_num, email
 
+        # One refresh so the profile starts with a fresh access token —
+        # BEFORE the bootstrap lock (the gate takes the same non-reentrant
+        # FileLock and POSTs over the network, which must never run under a
+        # held lock). The gate re-reads the freshest copy itself and
+        # persists via fingerprint CAS; _bootstrap then reads the rotated
+        # backup. Failure is non-fatal: the stored token may still be
+        # valid, and claude refreshes on its own at runtime. Setup-token
+        # accounts (--add-token) have no refresh token by design — skip
+        # silently instead of warning about a flow that can't happen.
+        pre_creds = self.switcher.read_account_credentials(account_num, email)
+        if pre_creds and self._has_refresh_token(pre_creds):
+            outcome = self.switcher.consume_backup_grant(
+                account_num, email, pre_creds
+            )
+            if outcome.error is not None and outcome.credentials:
+                # `error is None` is the gate's own "the slot is freshened
+                # and safe to activate" signal, and it is NOT implied by
+                # credentials being present: a failed persist returns the
+                # successor AND `transient`, with the backup still holding
+                # the generation whose grant was just spent.
+                #
+                # WARNING ABOUT IT IS NOT ENOUGH. `_bootstrap` re-reads the
+                # backup, so continuing seeds the profile from that spent
+                # generation and claude's first refresh gets invalid_grant —
+                # the warning scrolls past and the session is broken anyway.
+                #
+                # Refuse — but the two demoted shapes need OPPOSITE advice,
+                # and `error`/`credentials` cannot tell them apart, which is
+                # why the gate carries `stashed`.
+                #
+                # Stashed: retrying is right. The next run's gate adopts the
+                # successor without consuming anything and bootstraps
+                # normally, so the recovery machinery already built here does
+                # the rest.
+                #
+                # NOT stashed (`consume-gate-unpersisted`, where the persist
+                # AND the stash both failed): retrying POSTs the spent
+                # predecessor and earns a strike. The successor survived only
+                # in this return value, which the raise discards — saying
+                # "nothing was lost" there would be false on both counts. The
+                # remedy is the storage failure, which is what the gate's own
+                # ERROR log at that site already says.
+                #
+                # This shape is distinguishable at the call site: a genuine
+                # network-transient carries `credentials=None` and falls to
+                # the warning below, where continuing on the stored
+                # credentials is correct because nothing was spent.
+                if outcome.stashed:
+                    raise SessionError(
+                        f"Account-{account_num}'s refreshed credential could "
+                        f"not be stored, so the backup still holds a spent "
+                        f"grant. The successor is stashed — please retry, and "
+                        f"the next run adopts it automatically."
+                    )
+                raise SessionError(
+                    f"Account-{account_num}'s refreshed credential could "
+                    f"neither be stored nor stashed, so the backup holds a "
+                    f"spent grant and the successor is gone. Fix the storage "
+                    f"failure first; retrying before that spends nothing but "
+                    f"earns a strike. If the slot strikes, log in again and "
+                    f"re-add it: cswap --add-account --slot {account_num}"
+                )
+            if outcome.error is not None:
+                warning(
+                    f"Could not refresh the token for Account-{account_num}; "
+                    "continuing with the stored credentials."
+                )
+
         with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
             # Re-evaluate the marker under the lock, then re-check validity:
             # another `cswap run` may have bootstrapped while we waited.
-            if (session_dir / STALE_MARKER).exists() and not live_sessions_for(
-                session_dir
-            ):
+            if is_session_stale(session_dir) and profile_is_quiescent(session_dir):
                 self.switcher._invalidate_session_credentials(account_num, email)
-                (session_dir / STALE_MARKER).unlink(missing_ok=True)
+                clear_session_stale(session_dir)
             if self._is_session_valid(session_dir, email, org_uuid):
+                # Valid, but possibly not on the generation WE just paid for.
+                # The consume above runs outside this lock (it POSTs), so a
+                # peer `cswap run` can bootstrap while we wait — and its
+                # profile predates our rotation. Its refresh token is the one
+                # our gate consumed, so claude's own refresh would get
+                # invalid_grant on first use: a spent grant, silently.
+                # Validity is an identity check, not a generation check, so it
+                # cannot see this. Re-seed instead of returning early.
+                #
+                # NEVER under a live claude. _bootstrap deletes the profile's
+                # Keychain entry and overwrites .credentials.json, and the peer
+                # that bootstrapped ahead of us has already exec'd into that
+                # profile — rewriting it beneath a running instance is the
+                # failure every other invalidation site in this file guards
+                # against (the STALE_MARKER branch above, and
+                # _post_backup_write's). This branch fires precisely when the
+                # profile is VALID, which is the live case, so it needed the
+                # guard most and had it least. Deferring costs the peer a
+                # generation it can still refresh from; rewriting costs it the
+                # session.
+                if not self._profile_matches_backup(
+                    session_dir, account_num, email
+                ) and profile_is_quiescent(session_dir):
+                    self._bootstrap(session_dir, account_num, email, org_uuid)
                 if share is not None:
                     self._sync_sharing(session_dir, share, share_history)
                 return session_dir, account_num, email
@@ -570,7 +830,31 @@ class SessionManager:
             if share is not None:
                 self._sync_sharing(session_dir, share, share_history)
 
-            if not self._is_session_valid(session_dir, email, org_uuid):
+            verdict = self._session_validity(session_dir, email, org_uuid)
+            # NEITHER probe-failure verdict may reach `_cleanup_failed_session`
+            # below: it deletes the Keychain entry and the whole directory, and
+            # running it here would destroy a profile we never managed to look
+            # at — on nothing worse than a 10s timeout on a loaded machine.
+            #
+            # But "do not delete" is not "do not proceed". We have just
+            # bootstrapped from the backup credentials, so the same local
+            # artifacts that answer the reuse path answer this one, and a
+            # timeout here must not fail a launch that is fine (#224
+            # follow-up). Only "unreachable" still stops: no local file can
+            # tell us whether `claude` runs, and a session we cannot exec into
+            # is not a session.
+            if verdict == "unknown" and _artifacts_say_usable(
+                session_dir, email, org_uuid
+            ):
+                verdict = "valid"
+            if verdict in ("unknown", "unreachable"):
+                raise SessionError(
+                    f"Session profile for Account-{account_num} ({email}) could "
+                    f"not be verified: `claude auth status` did not run or did "
+                    f"not answer. The profile is left in place — check that "
+                    f"`claude` is on PATH, then retry."
+                )
+            if verdict != "valid":
                 self._cleanup_failed_session(session_dir)
                 raise SessionError(
                     f"Session profile for Account-{account_num} ({email}) failed "
@@ -581,6 +865,29 @@ class SessionManager:
 
         return session_dir, account_num, email
 
+    def _profile_matches_backup(
+        self, session_dir: Path, account_num: str, email: str
+    ) -> bool:
+        """Is the profile on the same credential generation as the backup?
+
+        Compared by fingerprint, because that is what identifies a generation;
+        the identity (email/org) is the same across all of them, which is why
+        ``_is_session_valid`` cannot answer this.
+
+        Unknowable answers are TRUE — an unreadable backup or profile is not
+        evidence of a mismatch, and re-bootstrapping on one would throw away a
+        working profile over a read error.
+        """
+        from claude_swap import oauth as _oauth
+
+        profile = read_session_credentials(session_dir)
+        backup = self.switcher.read_account_credentials(account_num, email)
+        if not profile or not backup:
+            return True
+        return _oauth.credential_fingerprint(
+            profile
+        ) == _oauth.credential_fingerprint(backup)
+
     def _bootstrap(
         self, session_dir: Path, account_num: str, email: str, org_uuid: str
     ) -> None:
@@ -589,29 +896,27 @@ class SessionManager:
         # entry from an earlier profile at this path would shadow the seed.
         delete_macos_keychain_entry(session_dir)
 
-        creds = self.switcher.read_account_credentials(account_num, email)
+        creds, unreadable = self.switcher._read_account_credentials_ex(
+            account_num, email
+        )
         if not creds:
+            if unreadable:
+                # Third copy of the switch path's message; same reason not to
+                # send the user to a re-add over a locked Keychain.
+                raise SessionError(
+                    f"Account-{account_num}'s backup is in the macOS Keychain "
+                    f"but it is unreadable right now (locked or no GUI "
+                    f"session). Retry from a GUI terminal; do not re-add."
+                )
             raise SessionError(
                 f"Account-{account_num} has no stored credentials. "
                 f"Re-add with: cswap --add-account --slot {account_num}"
             )
 
-        # One refresh so the profile starts with a fresh access token; persist
-        # a possibly-rotated refresh token back to backup so future switches
-        # and runs see the latest. Failure is non-fatal: the stored token may
-        # still be valid, and claude refreshes on its own at runtime.
-        # Setup-token accounts (--add-token) have no refresh token by design —
-        # skip silently instead of warning about a flow that can't happen.
-        if self._has_refresh_token(creds):
-            refreshed = refresh_oauth_credentials(creds)
-            if refreshed:
-                creds = refreshed
-                self.switcher.write_account_credentials(account_num, email, creds)
-            else:
-                warning(
-                    f"Could not refresh the token for Account-{account_num}; "
-                    "continuing with the stored credentials."
-                )
+        # The pre-lock refresh (see run(): the consume gate must not run
+        # under this lock — its POST is network and the FileLock is
+        # non-reentrant) may have already rotated the backup; the read
+        # above picked that successor up. No POST happens here.
 
         config_text = self.switcher.read_account_config(account_num, email)
         try:
@@ -630,9 +935,7 @@ class SessionManager:
             os.chmod(session_dir, 0o700)
 
         creds_path = session_dir / ".credentials.json"
-        creds_path.write_text(creds, encoding="utf-8")
-        if sys.platform != "win32":
-            os.chmod(creds_path, 0o600)
+        atomic_write_text(creds_path, creds)
 
         # Merge the identity seed into any existing .claude.json so a
         # re-bootstrap preserves the profile's own projects/history. The
@@ -648,9 +951,7 @@ class SessionManager:
         existing["oauthAccount"] = oauth_account
         existing["hasCompletedOnboarding"] = True
         existing.setdefault("theme", config_data.get("theme") or "dark")
-        config_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
-        if sys.platform != "win32":
-            os.chmod(config_path, 0o600)
+        atomic_write_text(config_path, json.dumps(existing, indent=2))
 
         self._logger.info(
             f"Bootstrapped session profile for account {account_num} at {session_dir}"
@@ -665,24 +966,45 @@ class SessionManager:
 
     def _cleanup_failed_session(self, session_dir: Path) -> None:
         # Keychain first: claude may have partially migrated the seed, and the
-        # hashed service name can't be recomputed once the dir is gone.
+        # hashed service name can't be recomputed once the dir is gone. The
+        # stale marker is a sibling, so rmtree does not take it.
         delete_macos_keychain_entry(session_dir)
         shutil.rmtree(session_dir, ignore_errors=True)
+        clear_session_stale(session_dir)
 
     # -- validation ------------------------------------------------------
 
-    def _is_session_valid(self, session_dir: Path, email: str, org_uuid: str) -> bool:
-        """Whether claude sees the profile as logged in with the right identity.
+    def _session_validity(
+        self, session_dir: Path, email: str, org_uuid: str
+    ) -> str:
+        """``"valid"`` / ``"invalid"`` / ``"unknown"`` / ``"unreachable"``.
 
         Local check only (`claude auth status` makes no API call): a revoked
         but unexpired token still passes and fails on first real use.
+
+        The last two are both "the PROBE failed, not the profile", and neither
+        may share a return value with ``"invalid"`` — the caller that acts on
+        ``"invalid"`` deletes the profile's Keychain entry and rmtree's the
+        directory, and a probe we could not run is not evidence about the
+        profile. They are split because REUSE wants opposite answers:
+
+        ``"unknown"`` — the probe ran and did not answer (timeout, output that
+        will not parse). Nothing suggests the profile is bad, so reuse leans
+        valid; on a loaded machine `claude`'s cold start exceeds the 10s
+        timeout and forcing a re-bootstrap there fails a launch that would
+        have worked (upstream #224/#225).
+
+        ``"unreachable"`` — `claude` could not be spawned at all. Reuse leans
+        invalid: a binary we cannot run cannot serve the session either way,
+        so the honest outcome is the bootstrap path and its "check that
+        `claude` is on PATH" error, not a silent reuse.
         """
         if not session_dir.is_dir():
-            return False
+            return "invalid"
         # On Windows `claude` is a `.cmd` shim, and a bare "claude" passed to
         # subprocess won't resolve it (PATHEXT isn't applied) — it raises
-        # FileNotFoundError, which the handler below turns into a false
-        # "failed validation". shutil.which finds the shim.
+        # FileNotFoundError. `shutil.which` finds the shim; when it finds
+        # nothing at all the run below still raises, and that is "unknown".
         claude_bin = shutil.which("claude") or "claude"
         try:
             result = subprocess.run(
@@ -693,41 +1015,65 @@ class SessionManager:
                 timeout=_AUTH_STATUS_TIMEOUT,
             )
         except subprocess.TimeoutExpired:
-            # A timeout is the machine under load, not a bad profile: this
-            # check is best-effort (see docstring), and setup_session
-            # escalates a False all the way to deleting the profile. Fall
-            # back to what local artifacts can answer without the probe:
-            # credential material must not be definitely absent (keychain-
-            # aware — claude migrates a macOS profile's credential into the
-            # keychain and deletes the plaintext seed, while stale
-            # invalidation deletes both) and the profile's recorded identity
-            # must not have drifted (in-session /login to another account).
-            # Anything subtler still fails on first real use.
-            return _may_have_credential_material(session_dir) and (
-                not session_identity_drifted(session_dir, email, org_uuid)
-            )
+            # The verdict layer answers what the PROBE established, and a
+            # timeout established nothing. Upstream's artifact fallback is a
+            # REUSE judgement, not a verdict, so it lives in
+            # `_is_session_valid` where its answer is what gets consumed —
+            # putting it here would make "the probe timed out" and "the
+            # profile is bad" the same value again, which is the conflation
+            # this whole tri-state exists to undo.
+            return "unknown"
         except OSError:
-            return False
+            return "unreachable"
         if result.returncode != 0:
-            return False
+            return "invalid"
         try:
             status = json.loads(result.stdout)
         except json.JSONDecodeError:
-            return False
+            return "unknown"
+        if not isinstance(status, dict):
+            return "unknown"
         if status.get("loggedIn") is not True:
-            return False
+            return "invalid"
         # Verified against claude 2.1.175; an env API key reports a different
         # method, and the probe env already drops those vars anyway.
         if status.get("authMethod") != "claude.ai":
-            return False
+            return "invalid"
         if status.get("email") != email:
-            return False
+            return "invalid"
         # Lenient org check: only when both sides have a value, so schema
         # drift degrades to email-only validation instead of false negatives.
         status_org = status.get("orgId")
         if status_org and org_uuid and status_org != org_uuid:
-            return False
-        return True
+            return "invalid"
+        return "valid"
+
+    def _is_session_valid(self, session_dir: Path, email: str, org_uuid: str) -> bool:
+        """Whether the profile is usable as far as we can tell.
+
+        Reuse-shaped view of :meth:`_session_validity`, and best-effort by
+        design. ``"unknown"`` — the probe ran and did not answer — is decided
+        from local artifacts instead of blanket-True, because "the probe timed
+        out" is not by itself a reason to reuse: credential material must not
+        be definitely absent (keychain-aware — claude migrates a macOS
+        profile's credential into the keychain and deletes the plaintext seed,
+        while stale invalidation deletes both) and the recorded identity must
+        not have drifted (in-session /login to another account). Anything
+        subtler still fails on first real use.
+
+        ``"unreachable"`` answers False without consulting artifacts: the
+        question there is not whether the profile holds a credential but
+        whether `claude` can be run at all, and no local file answers that.
+
+        Callers that DESTROY on a negative must use the full verdict instead.
+        For them the difference between "invalid" and "could not tell" is the
+        difference between a correct cleanup and deleting a working profile,
+        and this boolean cannot express it.
+        """
+        verdict = self._session_validity(session_dir, email, org_uuid)
+        if verdict == "unknown":
+            return _artifacts_say_usable(session_dir, email, org_uuid)
+        return verdict == "valid"
 
     # -- sharing ---------------------------------------------------------
 
@@ -1057,7 +1403,7 @@ class SessionManager:
             # Real per-account history accumulated before the flag existed.
             # Merging moves files out from under any claude still running in
             # this profile, so only migrate when the profile is quiescent.
-            if live_sessions_for(session_dir):
+            if not profile_is_quiescent(session_dir):
                 print(
                     dimmed(
                         f"Not sharing {dest.name} yet: another session is "
@@ -1067,7 +1413,11 @@ class SessionManager:
                 return False
             try:
                 self._merge_history_into_source(src, dest)
-            except OSError as e:
+            except (OSError, ValueError) as e:
+                # ValueError covers UnicodeDecodeError: a byte-corrupt
+                # history file is "nothing readable to merge", and losing a
+                # launch to a stray byte in ~/.claude/history.jsonl would
+                # strand every account that has not migrated yet.
                 self._logger.warning(
                     f"Could not merge {dest.name} into {src}: {e}"
                 )
@@ -1108,8 +1458,9 @@ class SessionManager:
         Directories merge file-by-file (transcript filenames are UUIDs, so
         collisions mean identical sessions — first writer wins and the
         duplicate is dropped). ``history.jsonl`` merges by appending lines
-        not already present. ``dest`` is removed once empty; any failure
-        raises OSError and leaves remaining files in place for the next try.
+        not already present. ``dest`` is removed once empty; any failure —
+        an OSError, or a UnicodeDecodeError on a byte-corrupt history file —
+        propagates and leaves remaining files in place for the next try.
         """
         if dest.is_dir():
             _mkdir_private(src)
@@ -1126,9 +1477,10 @@ class SessionManager:
                 shutil.move(str(path), str(target))
             dest.rmdir()
         else:
-            existing: set[str] = set()
+            existing_text = ""
             if src.exists():
-                existing = set(src.read_text(encoding="utf-8").splitlines())
+                existing_text = src.read_text(encoding="utf-8")
+            existing = set(existing_text.splitlines())
             lines = [
                 line
                 for line in dest.read_text(encoding="utf-8").splitlines()
@@ -1138,8 +1490,14 @@ class SessionManager:
                 src.parent.mkdir(parents=True, exist_ok=True)
                 if not src.exists():
                     src.touch(mode=0o600)  # match Claude Code's history mode
+                # A history.jsonl torn by a crashed append ends mid-line, and
+                # appending onto it would weld that tail to the first merged
+                # entry — one line that parses as neither, with no second
+                # copy to recover from once dest is unlinked below.
+                torn = bool(existing_text) and not existing_text.endswith("\n")
+                terminator = "\n" if torn else ""
                 with src.open("a", encoding="utf-8") as f:
-                    f.write("\n".join(lines) + "\n")
+                    f.write(terminator + "\n".join(lines) + "\n")
             dest.unlink()
 
     @staticmethod
@@ -1155,18 +1513,10 @@ class SessionManager:
     def _write_manifest(self, manifest_path: Path, items: list[str]) -> None:
         mode = "symlink" if self.switcher.platform != Platform.WINDOWS else "copy"
         payload = json.dumps({"items": items, "mode": mode}, indent=2)
-        fd, tmp = tempfile.mkstemp(
-            dir=str(manifest_path.parent), prefix=".cswap-shared-", suffix=".tmp"
-        )
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(payload)
-            replace_with_retry(tmp, manifest_path)
+            atomic_write_text(manifest_path, payload)
         except OSError:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+            pass  # best effort: a failed manifest must not fail a launch
 
     @staticmethod
     def _remove_managed(dest: Path) -> None:

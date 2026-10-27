@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import sys
 import unicodedata
 from pathlib import Path
@@ -21,6 +22,7 @@ from claude_swap.exceptions import (
     AccountNotFoundError,
     CredentialReadError,
     SessionError,
+    SwitchError,
     ValidationError,
 )
 from claude_swap.models import Platform
@@ -32,11 +34,13 @@ from claude_swap.session import (
     SessionManager,
     _probe_env,
     keychain_service_name,
-    live_sessions_for,
+    profile_is_quiescent,
     read_session_identity,
+    scan_live_sessions,
     session_dir_for,
     session_identity_drifted,
     slugify_email,
+    stale_marker_for,
 )
 from claude_swap.switcher import ClaudeAccountSwitcher
 
@@ -153,13 +157,20 @@ def auth_status_tracks_seed(monkeypatch):
 
 @pytest.fixture
 def refresh_rotates(monkeypatch):
+    """Track consume-gate calls; the gate persists ROTATED_CREDS like the
+    real one does (bootstrap re-reads the backup afterwards)."""
     calls: list[str] = []
 
-    def fake_refresh(creds: str) -> str:
-        calls.append(creds)
-        return ROTATED_CREDS
+    def fake_gate(self, account_num: str, email: str, snapshot: str):
+        from claude_swap import oauth as oauth_mod
+        calls.append(snapshot)
+        self._write_account_credentials(account_num, email, ROTATED_CREDS)
+        return oauth_mod.RefreshOutcome(ROTATED_CREDS, None)
 
-    monkeypatch.setattr(session_mod, "refresh_oauth_credentials", fake_refresh)
+    from claude_swap.switcher import ClaudeAccountSwitcher
+    monkeypatch.setattr(
+        ClaudeAccountSwitcher, "consume_backup_grant", fake_gate
+    )
     return calls
 
 
@@ -169,6 +180,14 @@ def make_live(session_dir: Path, pid: int | None = None) -> None:
     pid_dir = session_dir / "sessions"
     pid_dir.mkdir(parents=True, exist_ok=True)
     (pid_dir / f"{pid}.json").write_text(json.dumps({"pid": pid}))
+
+
+def _mark_stale(session_dir: Path, legacy_location: bool = False) -> None:
+    """Plant a stale marker, in the current (sibling) or pre-move (child) spot."""
+    if legacy_location:
+        (session_dir / session_mod.STALE_MARKER).touch()
+    else:
+        session_mod.mark_session_stale(session_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -217,16 +236,35 @@ class TestHelpers:
         assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
         assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path)
 
-    def test_live_sessions_for_missing_dir(self, tmp_path):
-        assert live_sessions_for(tmp_path / "nope") == []
+    def test_scan_live_sessions_missing_dir(self, tmp_path):
+        assert scan_live_sessions(tmp_path / "nope") == ([], 0)
 
-    def test_live_sessions_for_dead_pid_ignored(self, tmp_path):
+    def test_scan_live_sessions_dead_pid_ignored(self, tmp_path):
         make_live(tmp_path, pid=2**22 + 12345)  # vanishingly unlikely to exist
-        assert live_sessions_for(tmp_path) == []
+        assert scan_live_sessions(tmp_path) == ([], 0)
 
-    def test_live_sessions_for_own_pid(self, tmp_path):
+    def test_scan_live_sessions_own_pid(self, tmp_path):
         make_live(tmp_path)
-        assert [s.pid for s in live_sessions_for(tmp_path)] == [os.getpid()]
+        sessions, unreadable = scan_live_sessions(tmp_path)
+        assert [s.pid for s in sessions] == [os.getpid()]
+        assert unreadable == 0
+
+    def test_unreadable_record_is_not_quiescent(self, tmp_path):
+        """A dead PID and an unreadable record both yield zero live sessions.
+        Only the first is evidence that nothing is running."""
+        (tmp_path / "sessions").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "sessions" / "9999.json").write_text(
+            "not json{{{", encoding="utf-8"
+        )
+
+        assert scan_live_sessions(tmp_path) == ([], 1)
+        assert not profile_is_quiescent(tmp_path)
+
+    def test_dead_pid_is_quiescent(self, tmp_path):
+        """The control: zero live from a READABLE record IS safe to act on,
+        so the predicate is not just refusing everything."""
+        make_live(tmp_path, pid=2**22 + 12345)
+        assert profile_is_quiescent(tmp_path)
 
 
 class TestSessionIdentity:
@@ -366,7 +404,12 @@ class TestBootstrap:
     def test_refresh_failure_uses_stored_creds(
         self, manager, auth_status_tracks_seed, monkeypatch, capsys
     ):
-        monkeypatch.setattr(session_mod, "refresh_oauth_credentials", lambda c: None)
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher, "consume_backup_grant",
+            lambda self, num, email, snap: oauth.RefreshOutcome(
+                None, "transient"
+            ),
+        )
         session_dir, _, _ = manager.setup_session("2", share=False)
         assert (session_dir / ".credentials.json").read_text() == CREDS
         assert "Could not refresh" in capsys.readouterr().out
@@ -381,9 +424,9 @@ class TestBootstrap:
         seeded_switcher._write_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL, token_creds)
         refresh_calls = []
         monkeypatch.setattr(
-            session_mod,
-            "refresh_oauth_credentials",
-            lambda c: refresh_calls.append(c) or None,
+            ClaudeAccountSwitcher, "consume_backup_grant",
+            lambda self, num, email, snap: refresh_calls.append(snap)
+            or oauth.RefreshOutcome(None, "transient"),
         )
 
         session_dir, _, _ = manager.setup_session("2", share=False)
@@ -453,22 +496,30 @@ class TestBootstrap:
 
         assert block_real_keychain.get_password(service, account) is None
 
+    @pytest.mark.parametrize("legacy_location", [False, True])
     def test_stale_marker_forces_rebootstrap_after_session_exits(
-        self, manager, seeded_switcher, auth_status_tracks_seed, refresh_rotates
+        self, manager, seeded_switcher, auth_status_tracks_seed, refresh_rotates,
+        legacy_location: bool,
     ):
         """Backup creds updated while the session was live → after it exits,
         the next run must re-bootstrap from the fresh backup even though the
-        stale profile would still pass the local reuse check."""
+        stale profile would still pass the local reuse check.
+
+        `legacy_location=True` is the upgrade path: the marker moved to a
+        SIBLING of the profile dir (a child could not be written by the fault
+        that motivates it), and a profile marked by an older cswap on this
+        machine has a pending re-bootstrap that the move must not drop.
+        """
         session_dir, _, _ = manager.setup_session("2", share=False)
         (session_dir / ".credentials.json").write_text("stale lineage")
-        (session_dir / session_mod.STALE_MARKER).touch()
+        _mark_stale(session_dir, legacy_location)
         # No live PID files → the session has exited.
 
         manager.setup_session("2", share=False)
 
         # Re-bootstrapped: fresh (refreshed) creds, marker cleared.
         assert (session_dir / ".credentials.json").read_text() == ROTATED_CREDS
-        assert not (session_dir / session_mod.STALE_MARKER).exists()
+        assert not session_mod.is_session_stale(session_dir)
 
     def test_stale_marker_plus_probe_timeout_still_rebootstraps(
         self, manager, seeded_switcher, auth_status_tracks_seed, refresh_rotates,
@@ -495,20 +546,22 @@ class TestBootstrap:
         assert (session_dir / ".credentials.json").read_text() == ROTATED_CREDS
         assert not (session_dir / session_mod.STALE_MARKER).exists()
 
+    @pytest.mark.parametrize("legacy_location", [False, True])
     def test_stale_marker_preserved_while_session_still_live(
-        self, manager, seeded_switcher, auth_status_tracks_seed, refresh_rotates
+        self, manager, seeded_switcher, auth_status_tracks_seed, refresh_rotates,
+        legacy_location: bool,
     ):
         """A second `cswap run` joining a live session must not invalidate
         under the running claude; the marker survives for later."""
         session_dir, _, _ = manager.setup_session("2", share=False)
         (session_dir / ".credentials.json").write_text("live lineage")
-        (session_dir / session_mod.STALE_MARKER).touch()
+        _mark_stale(session_dir, legacy_location)
         make_live(session_dir)
 
         manager.setup_session("2", share=False)
 
         assert (session_dir / ".credentials.json").read_text() == "live lineage"
-        assert (session_dir / session_mod.STALE_MARKER).exists()
+        assert session_mod.is_session_stale(session_dir)
 
     def test_rebootstrap_preserves_profile_history(
         self, manager, seeded_switcher, auth_status_tracks_seed, refresh_rotates
@@ -1281,6 +1334,29 @@ class TestRun:
         assert "CLAUDE_CONFIG_DIR" not in exc.value.env
         assert "already the active default login" in capsys.readouterr().out
 
+    def test_require_session_refuses_fast_path(
+        self, manager, capture_exec, monkeypatch
+    ):
+        monkeypatch.setattr(
+            manager.switcher,
+            "_get_current_account",
+            lambda: (ACCOUNT_EMAIL, ORG_UUID),
+        )
+        # SessionError, not _ExecCalled: nothing may launch.
+        with pytest.raises(SessionError, match="active default login"):
+            manager.run("2", [], require_session=True)
+
+    def test_require_session_is_inert_off_the_active_account(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates
+    ):
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [], require_session=True)
+
+        session_dir = session_dir_for(
+            manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        assert exc.value.env["CLAUDE_CONFIG_DIR"] == str(session_dir)
+
     def test_preset_config_dir_disables_fast_path(
         self,
         manager,
@@ -1494,6 +1570,79 @@ class TestGuards:
         data = seeded_switcher._get_sequence_data()
         assert data["activeAccountNumber"] == int(ACCOUNT_NUM)
 
+    def test_switch_refuses_live_target_whose_profile_is_ahead(
+        self, seeded_switcher, monkeypatch
+    ):
+        """Once the live session has rotated past the backup, the backup is a
+        consumed generation and activating it could only fail."""
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True)
+        (session_dir / ".credentials.json").write_text(ROTATED_CREDS)
+        (session_dir / ".claude.json").write_text(CONFIG)
+        make_live(session_dir)
+        monkeypatch.setattr(seeded_switcher, "_get_current_account", lambda: None)
+
+        with pytest.raises(SwitchError, match="rotated past the stored backup"):
+            seeded_switcher._perform_switch(ACCOUNT_NUM)
+
+        data = seeded_switcher._get_sequence_data()
+        assert data["activeAccountNumber"] == 1
+        assert (
+            seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL)
+            == CREDS
+        )
+
+    def test_switch_adopts_exited_session_credential_first(
+        self, seeded_switcher, monkeypatch
+    ):
+        """Nothing running against the profile: its newer generation becomes
+        the backup, and that is what the switch activates."""
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True)
+        (session_dir / ".credentials.json").write_text(ROTATED_CREDS)
+        (session_dir / ".claude.json").write_text(CONFIG)
+        monkeypatch.setattr(seeded_switcher, "_get_current_account", lambda: None)
+        monkeypatch.setattr(seeded_switcher, "list_accounts", lambda **kw: None)
+
+        seeded_switcher._perform_switch(ACCOUNT_NUM)
+
+        assert (
+            seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL)
+            == ROTATED_CREDS
+        )
+        assert seeded_switcher._read_credentials() == ROTATED_CREDS
+        # The profile is the source of that generation, not a stale seed.
+        assert (session_dir / ".credentials.json").read_text() == ROTATED_CREDS
+
+    def test_switch_refuses_exited_target_whose_ahead_profile_cannot_be_adopted(
+        self, seeded_switcher, monkeypatch
+    ):
+        """Nothing running and the profile ahead, but its identity unreadable:
+        adoption refuses to write (it cannot tell whose credential that is),
+        and the switch must not then activate the consumed backup silently."""
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True)
+        (session_dir / ".credentials.json").write_text(ROTATED_CREDS)
+        (session_dir / ".claude.json").write_text("not json{{{")
+        monkeypatch.setattr(seeded_switcher, "_get_current_account", lambda: None)
+
+        with pytest.raises(SwitchError, match="could not be adopted"):
+            seeded_switcher._perform_switch(ACCOUNT_NUM)
+
+        data = seeded_switcher._get_sequence_data()
+        assert data["activeAccountNumber"] == 1
+        assert (
+            seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL)
+            == CREDS
+        )
+        assert (session_dir / ".credentials.json").read_text() == ROTATED_CREDS
+
     def test_backup_credential_write_invalidates_stale_profile(
         self, seeded_switcher, block_real_keychain
     ):
@@ -1519,22 +1668,167 @@ class TestGuards:
         assert (session_dir / ".claude.json").exists()  # history preserved
         assert block_real_keychain.get_password(service, account) is None
 
-    def test_backup_credential_write_leaves_live_profile_alone_but_marks_stale(
-        self, seeded_switcher
+    @pytest.mark.parametrize(
+        "dir_still_there", [True, False],
+        ids=["profile_dir_present", "profile_dir_already_gone"],
+    )
+    def test_deleting_a_profile_takes_its_stale_marker_with_it(
+        self, seeded_switcher, dir_still_there
     ):
+        """The marker is a SIBLING of the profile dir, so `rmtree` no longer
+        removes it. A leftover marker outlives the profile it described, and
+        the next profile created for that same slot+email inherits a
+        re-bootstrap flag that nothing set for it.
+
+        The already-gone case is what ``purge`` leaves behind: it removes
+        profile DIRS (``iterdir()`` filtered by ``is_dir()``) and the marker is
+        a dot-FILE beside them, so it survives by design. This function then
+        early-outs on the missing directory and never reaches the marker —
+        two artifacts, one of them consulted.
+        """
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        session_mod.mark_session_stale(session_dir)
+        assert session_mod.is_session_stale(session_dir), "premise: marked"
+        if not dir_still_there:
+            shutil.rmtree(session_dir)  # what purge does
+            assert session_mod.is_session_stale(session_dir), (
+                "premise: the marker outlives the dir purge removed"
+            )
+
+        seeded_switcher._delete_session_profile(ACCOUNT_NUM, ACCOUNT_EMAIL)
+
+        assert not session_dir.exists(), "premise: the profile is gone"
+        assert not session_mod.is_session_stale(session_dir), (
+            "the marker outlived the profile: a freshly created profile for "
+            "this slot inherits a stale flag nothing set for it"
+        )
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root)",
+    )
+    @pytest.mark.parametrize(
+        "deny, marker",
+        [
+            ("child", "legacy"),
+            ("child", None),
+            (None, "legacy"),
+            ("parent", "sibling"),
+            ("parent", None),
+        ],
+        ids=[
+            "denied_with_legacy_marker",
+            "denied_no_marker",
+            "writable_with_marker",
+            "denied_parent_with_sibling_marker",
+            "denied_parent_no_marker",
+        ],
+    )
+    def test_delete_session_profile_survives_a_denied_dir_with_legacy_marker(
+        self, seeded_switcher, caplog, deny, marker
+    ):
+        """`clear_session_stale` unlinks two marker locations: a legacy CHILD
+        of the profile dir, and the SIBLING (in the profile dir's PARENT)
+        that is where every marker is written today. The
+        `rmtree(ignore_errors=True)` right above it already tolerates EACCES
+        on the profile dir -- neither `unlink` does on its own, so only the
+        COMBINATION (a denied dir + a marker actually inside it) raises,
+        right after `remove_account` has already deleted the credentials but
+        before it writes the roster. Covers both marker locations and both
+        denied dirs (the profile dir itself, and its parent)."""
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / "x.txt").write_text("keep", encoding="utf-8")
+        if marker == "legacy":
+            (session_dir / session_mod.STALE_MARKER).touch()
+        elif marker == "sibling":
+            stale_marker_for(session_dir).touch()
+        denied_dir = session_dir if deny == "child" else session_dir.parent
+        if deny:
+            denied_dir.chmod(0o500)
+        import logging
+
+        with caplog.at_level(logging.DEBUG, logger="claude-swap"):
+            try:
+                seeded_switcher._delete_session_profile(ACCOUNT_NUM, ACCOUNT_EMAIL)
+            finally:
+                if deny:
+                    try:
+                        denied_dir.chmod(0o700)
+                    except OSError:
+                        pass
+
+        # Tolerating the fault is the point; reporting the removal anyway is
+        # not. Whatever survived on disk must be named at WARNING+, because
+        # the caller (`remove_account`) has already deleted the credentials
+        # and goes on to write the roster -- a slot recorded as gone with its
+        # profile still there is the state nothing else looks for.
+        leftovers = [
+            pth
+            for pth in (session_dir, stale_marker_for(session_dir),
+                        session_dir / session_mod.STALE_MARKER)
+            if pth.exists()
+        ]
+        warned = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert not leftovers or warned, (
+            f"reported removal while {[str(x) for x in leftovers]} survived, "
+            "and said nothing at WARNING+"
+        )
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root)",
+    )
+    @pytest.mark.parametrize("marker_lands", [True, False])
+    def test_backup_credential_write_leaves_live_profile_alone_but_marks_stale(
+        self, seeded_switcher, caplog, marker_lands
+    ):
+        """The LIVE arm used to discard `mark_session_stale`'s return value, so
+        a marker that failed to land was reported to nobody -- the same
+        silent-fallback shape the non-live arm's own ERROR log exists to
+        avoid."""
+        import logging
+
         session_dir = session_dir_for(
             seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
         )
         make_live(session_dir)
         (session_dir / ".credentials.json").write_text("live session creds")
 
-        seeded_switcher._write_account_credentials(
-            ACCOUNT_NUM, ACCOUNT_EMAIL, ROTATED_CREDS
-        )
+        if not marker_lands:
+            session_dir.parent.chmod(0o500)
+        try:
+            with caplog.at_level(logging.WARNING, logger="claude-swap"):
+                seeded_switcher._write_account_credentials(
+                    ACCOUNT_NUM, ACCOUNT_EMAIL, ROTATED_CREDS
+                )
+        finally:
+            if not marker_lands:
+                session_dir.parent.chmod(0o700)
 
-        # Live copy untouched, but flagged for re-bootstrap after exit.
+        # Live copy untouched either way.
         assert (session_dir / ".credentials.json").read_text() == "live session creds"
-        assert (session_dir / session_mod.STALE_MARKER).exists()
+
+        if marker_lands:
+            assert session_mod.is_session_stale(session_dir)
+            assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+        else:
+            assert not session_mod.is_session_stale(session_dir), (
+                "premise: the marker's own write target was denied"
+            )
+            assert any(
+                r.levelno >= logging.ERROR and ACCOUNT_NUM in r.getMessage()
+                for r in caplog.records
+            ), (
+                "the LIVE arm's failed marker was reported to nobody -- a "
+                "function that reports failure to nobody has not stopped "
+                "reporting success"
+            )
 
     def test_list_skips_refresh_for_live_session_accounts(
         self, seeded_switcher, monkeypatch
@@ -1545,10 +1839,15 @@ class TestGuards:
         session_dir = session_dir_for(
             seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
         )
+        # Unexpired, so the read-only request is made; an expired copy under
+        # a live session is not requested at all.
+        seeded_switcher._write_account_credentials(
+            ACCOUNT_NUM, ACCOUNT_EMAIL, ROTATED_CREDS
+        )
         make_live(session_dir)
         seen: dict[str, bool] = {}
 
-        def fake_fetch(num, email, creds, is_active=False, persist_credentials=None):
+        def fake_fetch(num, email, creds, is_active=False, persist_credentials=None, **kwargs):
             seen[num] = is_active
             return oauth.UsageOutcome(None)
 
@@ -1665,12 +1964,47 @@ class TestShareHistoryPosix:
         ).read_text() == "main-a\n"
         assert (session_dir / "projects").is_symlink()
 
+    def test_merge_keeps_an_unterminated_shared_line_whole(self, history_setup):
+        source, session_dir, mgr = history_setup
+        (source / "history.jsonl").write_text('{"p": "main"}')  # torn tail
+        (session_dir / "history.jsonl").write_text('{"p": "profile"}\n')
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        lines = (source / "history.jsonl").read_text().splitlines()
+        assert lines == ['{"p": "main"}', '{"p": "profile"}']
+
+    def test_merge_skipped_when_profile_history_is_byte_corrupt(self, history_setup):
+        source, session_dir, mgr = history_setup
+        (session_dir / "history.jsonl").write_bytes(b'{"p": "\xff\xfe"}\n')
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        # Unreadable history is skipped, not fatal: the launch goes ahead and
+        # the bytes stay put for a later attempt.
+        assert (session_dir / "history.jsonl").read_bytes() == b'{"p": "\xff\xfe"}\n'
+        assert (session_dir / "settings.json").is_symlink()
+        manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
+        assert "history.jsonl" not in manifest["items"]
+
+    def test_merge_skipped_when_shared_history_is_byte_corrupt(self, history_setup):
+        source, session_dir, mgr = history_setup
+        (source / "history.jsonl").write_bytes(b'{"p": "\xff\xfe"}\n')
+        (session_dir / "history.jsonl").write_text('{"p": "profile"}\n')
+
+        mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert (session_dir / "history.jsonl").read_text() == '{"p": "profile"}\n'
+        assert (session_dir / "settings.json").is_symlink()
+        manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
+        assert "history.jsonl" not in manifest["items"]
+
     def test_merge_deferred_while_profile_live(self, history_setup, monkeypatch):
         source, session_dir, mgr = history_setup
         (session_dir / "projects").mkdir()
         (session_dir / "projects" / "x.jsonl").write_text("live\n")
         monkeypatch.setattr(
-            session_mod, "live_sessions_for", lambda _dir: [object()]
+            session_mod, "scan_live_sessions", lambda _dir: ([object()], 0)
         )
 
         mgr._sync_sharing(session_dir, share=True, share_history=True)
@@ -1833,6 +2167,119 @@ class TestReadSessionCredentials:
         )
         creds = session_mod.read_session_credentials(session_dir)
         assert creds is not None and "sk-seed" in creds
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="symlinks are POSIX-only")
+    def test_symlinked_profile_reads_the_target_keychain_entry(
+        self, tmp_path, macos_platform, block_real_keychain
+    ):
+        """A tool that launches claude at a shared directory and leases it to
+        an account through a profile symlink leaves every rotation under the
+        target's hashed name, with the seed at the link's path behind it."""
+        target = tmp_path / "space"
+        target.mkdir()
+        (target / ".credentials.json").write_text(
+            '{"claudeAiOauth": {"accessToken": "sk-stale-seed"}}'
+        )
+        session_dir = tmp_path / "sess"
+        session_dir.symlink_to(target)
+        block_real_keychain.set_password(
+            keychain_service_name(target),
+            session_mod._keychain_account_name(),
+            '{"claudeAiOauth": {"accessToken": "sk-rotated"}}',
+        )
+        creds = session_mod.read_session_credentials(session_dir)
+        assert creds is not None and "sk-rotated" in creds
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="symlinks are POSIX-only")
+    def test_symlinked_profile_prefers_its_own_keychain_entry(
+        self, tmp_path, macos_platform, block_real_keychain
+    ):
+        target = tmp_path / "space"
+        target.mkdir()
+        session_dir = tmp_path / "sess"
+        session_dir.symlink_to(target)
+        account = session_mod._keychain_account_name()
+        block_real_keychain.set_password(
+            keychain_service_name(target),
+            account,
+            '{"claudeAiOauth": {"accessToken": "sk-target"}}',
+        )
+        block_real_keychain.set_password(
+            keychain_service_name(session_dir),
+            account,
+            '{"claudeAiOauth": {"accessToken": "sk-own"}}',
+        )
+        creds = session_mod.read_session_credentials(session_dir)
+        assert creds is not None and "sk-own" in creds
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="symlinks are POSIX-only")
+    def test_relative_symlink_target_is_normalised_before_hashing(
+        self, tmp_path, macos_platform, block_real_keychain
+    ):
+        """``sessions/profile -> ../space`` hashes ``/x/space``, the path a
+        tool launching at the target exports, not ``/x/sessions/../space``."""
+        target = tmp_path / "space"
+        target.mkdir()
+        (target / ".credentials.json").write_text(
+            '{"claudeAiOauth": {"accessToken": "sk-stale-seed"}}'
+        )
+        (tmp_path / "sessions").mkdir()
+        session_dir = tmp_path / "sessions" / "profile"
+        session_dir.symlink_to("../space")
+        block_real_keychain.set_password(
+            keychain_service_name(target),
+            session_mod._keychain_account_name(),
+            '{"claudeAiOauth": {"accessToken": "sk-rotated"}}',
+        )
+        creds = session_mod.read_session_credentials(session_dir)
+        assert creds is not None and "sk-rotated" in creds
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="symlinks are POSIX-only")
+    def test_lexical_target_naming_another_directory_is_not_consulted(
+        self, tmp_path, macos_platform, block_real_keychain
+    ):
+        """When the link's parent is itself a symlink elsewhere, ``..`` resolves
+        under the parent's target, so the lexical spelling names an unrelated
+        directory whose entry must never be served as this profile's."""
+        (tmp_path / "leases" / "sessions").mkdir(parents=True)
+        (tmp_path / "leases" / "space").mkdir()
+        (tmp_path / "leases" / "space" / ".credentials.json").write_text(
+            '{"claudeAiOauth": {"accessToken": "sk-seed"}}'
+        )
+        (tmp_path / "sessions").symlink_to("leases/sessions")
+        session_dir = tmp_path / "sessions" / "profile"
+        session_dir.symlink_to("../space")
+        unrelated = tmp_path / "space"
+        unrelated.mkdir()
+        block_real_keychain.set_password(
+            keychain_service_name(unrelated),
+            session_mod._keychain_account_name(),
+            '{"claudeAiOauth": {"accessToken": "sk-unrelated"}}',
+        )
+        creds = session_mod.read_session_credentials(session_dir)
+        assert creds is not None and "sk-seed" in creds
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="symlinks are POSIX-only")
+    def test_raw_joined_target_spelling_still_matches(
+        self, tmp_path, macos_platform, block_real_keychain
+    ):
+        """A tool that exports ``$(dirname link)/$(readlink link)`` verbatim
+        hashes the un-normalised join; that spelling stays a candidate."""
+        target = tmp_path / "space"
+        target.mkdir()
+        (target / ".credentials.json").write_text(
+            '{"claudeAiOauth": {"accessToken": "sk-stale-seed"}}'
+        )
+        (tmp_path / "sessions").mkdir()
+        session_dir = tmp_path / "sessions" / "profile"
+        session_dir.symlink_to("../space")
+        block_real_keychain.set_password(
+            keychain_service_name(f"{session_dir.parent}/../space"),
+            session_mod._keychain_account_name(),
+            '{"claudeAiOauth": {"accessToken": "sk-rotated"}}',
+        )
+        creds = session_mod.read_session_credentials(session_dir)
+        assert creds is not None and "sk-rotated" in creds
 
 
 ACTIVE_TOKEN = "active-store-token"
@@ -2237,3 +2684,339 @@ class TestCaptureCredentials:
             switcher.add_account()
 
         assert "1" not in (switcher._get_sequence_data() or {}).get("accounts", {})
+
+class TestBootstrapRefreshRoutesThroughGate:
+    """M2: the session-profile bootstrap refresh consumes the backup rt via
+    the switcher's consume gate, not a direct POST of its own read."""
+
+    def test_bootstrap_uses_gate(self, temp_home, monkeypatch):
+        from claude_swap import oauth as oauth_mod
+        from claude_swap.switcher import ClaudeAccountSwitcher
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._init_sequence_file()
+        expired = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-o", "refreshToken": "rt-o",
+                "expiresAt": 1000,
+            }
+        })
+        s._write_account_credentials("1", "a@example.com", expired)
+        s._write_account_config("1", "a@example.com", json.dumps({
+            "oauthAccount": {"emailAddress": "a@example.com"},
+        }))
+        data = s._get_sequence_data()
+        data["accounts"]["1"] = {"email": "a@example.com", "uuid": "u1",
+                                 "organizationUuid": "", "organizationName": ""}
+        data["sequence"] = [1]
+        s._write_json(s.sequence_file, data)
+        fresh = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-f", "refreshToken": "rt-f",
+                "expiresAt": 9999999999000,
+            }
+        })
+        gate = {}
+
+        def mock_gate(num, email, snapshot):
+            gate["args"] = (num, email)
+            return oauth_mod.RefreshOutcome(fresh, None)
+
+        monkeypatch.setattr(s, "consume_backup_grant", mock_gate)
+        direct = {}
+
+        def direct_post(credentials, **kw):
+            direct["called"] = True
+            return oauth_mod.RefreshOutcome(None, "transient")
+
+        # The bypass seam: session.py no longer imports any direct refresh
+        # helper, so a regression would have to call oauth's POST directly.
+        monkeypatch.setattr(
+            "claude_swap.oauth.try_refresh_oauth_credentials", direct_post
+        )
+        monkeypatch.setattr(
+            "claude_swap.oauth.refresh_oauth_credentials", direct_post
+        )
+        from claude_swap.session import SessionManager
+        mgr = SessionManager(s)
+        # setup_session is the seam: it must call the gate BEFORE the
+        # bootstrap lock (the gate takes the same non-reentrant FileLock).
+        # (run() itself needs a claude binary on PATH — absent on CI.)
+        try:
+            mgr.setup_session("1", share=False)
+        except Exception:
+            pass  # profile validation may fail in this stub env — the
+                  # assertion below is about the gate routing only
+        assert gate.get("args") == ("1", "a@example.com")
+        assert "called" not in direct
+
+
+class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
+    """A one-time grant consumed for THIS pass must reach the profile it was for.
+
+    The consume runs before the bootstrap lock (it POSTs, and must never hold
+    one). The under-lock re-check then returns early when another `cswap run`
+    bootstrapped while we waited — at which point this pass has already burned
+    a one-time refresh token whose successor nobody uses for the session it was
+    fetched for. The successor is persisted to the BACKUP, so nothing is lost;
+    what must hold is that the winning profile is seeded from that rotated
+    backup rather than from the generation we just spent.
+    """
+
+    def test_the_early_return_leaves_the_profile_on_the_rotated_generation(
+        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch
+    ):
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+
+        # The gate rotates the backup, exactly as the real one does.
+        def fake_gate(self, num, email, snapshot):
+            self._write_account_credentials(num, email, ROTATED_CREDS)
+            return oauth.RefreshOutcome(ROTATED_CREDS, None)
+
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher, "consume_backup_grant", fake_gate
+        )
+
+        # The pre-lock check must MISS (or we never reach the consume at all);
+        # the peer then bootstraps while we wait, so the under-lock re-check
+        # hits — on a profile seeded BEFORE our rotation.
+        calls = {"n": 0}
+
+        def peer_bootstraps_while_we_wait(self, sdir, email, org_uuid):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return False  # pre-lock: nothing there yet
+            sdir.mkdir(parents=True, exist_ok=True)
+            (sdir / ".credentials.json").write_text(CREDS)  # PRE-rotation
+            return True
+
+        monkeypatch.setattr(
+            SessionManager, "_is_session_valid", peer_bootstraps_while_we_wait
+        )
+
+        got, _, _ = manager.setup_session("2", share=False)
+
+        assert (got / ".credentials.json").read_text() == ROTATED_CREDS, (
+            "the profile kept a generation the consume already spent"
+        )
+
+    def test_a_live_peer_is_not_re_seeded_beneath_itself(
+        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch
+    ):
+        """The re-seed above must never fire under a RUNNING claude.
+
+        Same shape as the test above — a peer bootstraps a pre-rotation
+        profile while we wait for the lock — except the peer has already
+        exec'd into it. `_bootstrap` deletes the profile's Keychain entry and
+        overwrites `.credentials.json`, so re-seeding there costs the peer its
+        session, while deferring costs it only a generation it can still
+        refresh from.
+
+        Mutation-checked: dropping `and profile_is_quiescent(session_dir)`
+        left all 1783 green. The branch fires precisely when the profile is
+        VALID, which IS the live case, so it needed the guard most and had
+        nothing pinning it.
+        """
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+
+        def fake_gate(self, num, email, snapshot):
+            self._write_account_credentials(num, email, ROTATED_CREDS)
+            return oauth.RefreshOutcome(ROTATED_CREDS, None)
+
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher, "consume_backup_grant", fake_gate
+        )
+
+        calls = {"n": 0}
+
+        def peer_bootstraps_while_we_wait(self, sdir, email, org_uuid):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return False
+            sdir.mkdir(parents=True, exist_ok=True)
+            (sdir / ".credentials.json").write_text(CREDS)  # PRE-rotation
+            return True
+
+        monkeypatch.setattr(
+            SessionManager, "_is_session_valid", peer_bootstraps_while_we_wait
+        )
+        # ...and that peer is RUNNING against the profile.
+        live = SimpleNamespace(pid=4242)
+        monkeypatch.setattr(
+            session_mod, "scan_live_sessions", lambda _sdir: ([live], 0)
+        )
+
+        got, _, _ = manager.setup_session("2", share=False)
+
+        assert (got / ".credentials.json").read_text() == CREDS, (
+            "re-seeded a profile a live claude is running against; "
+            "_bootstrap would delete its Keychain entry mid-session"
+        )
+
+    def test_an_unverifiable_probe_does_not_destroy_the_profile(
+        self, manager, seeded_switcher, monkeypatch
+    ):
+        """`claude` unresolvable on PATH is not a verdict about the profile.
+
+        `_is_session_valid` catches OSError/TimeoutExpired and returns False,
+        and the post-bootstrap caller reads False as "invalid" and runs
+        `_cleanup_failed_session` — which deletes the Keychain entry AND
+        rmtree's the profile, then tells the user to re-add the account. So a
+        missing binary, or `claude auth status` exceeding its 10s timeout on a
+        loaded machine, destroys a profile that was just built.
+
+        The file's own comment above that probe records this already happening
+        on Windows via FileNotFoundError; that fixed the PATHEXT cause and left
+        the collapse.
+        """
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+
+        def unresolvable(*args, **kwargs):
+            raise FileNotFoundError(2, "No such file or directory", "claude")
+
+        monkeypatch.setattr(session_mod.subprocess, "run", unresolvable)
+
+        with pytest.raises(SessionError, match="could not be verified"):
+            manager.setup_session(ACCOUNT_NUM, share=False)
+
+        assert session_dir.exists(), (
+            "deleted a profile it was never able to verify — the probe failing "
+            "is not evidence the profile is invalid"
+        )
+
+    def test_a_genuinely_invalid_profile_is_still_cleaned_up(
+        self, manager, seeded_switcher, monkeypatch
+    ):
+        """The control. A probe that RUNS and reports not-logged-in is a real
+        verdict, and must still clean up — otherwise the test above passes on
+        a version that simply never cleans up anything."""
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+
+        def not_logged_in(*args, **kwargs):
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps({"loggedIn": False}), stderr=""
+            )
+
+        monkeypatch.setattr(session_mod.subprocess, "run", not_logged_in)
+
+        with pytest.raises(SessionError, match="failed validation"):
+            manager.setup_session(ACCOUNT_NUM, share=False)
+
+        assert not session_dir.exists()
+
+    def test_a_failed_persist_does_not_seed_the_profile_from_a_spent_grant(
+        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch
+    ):
+        """A failed persist returns credentials AND an error — both matter.
+
+        The gate consumes the grant, fails to write the successor, and reports
+        ``transient`` while the BACKUP still holds the spent generation. Its
+        own comment says callers read ``error is None`` as "safe to activate",
+        and after a failed persist it is the opposite.
+
+        Warning about it is not enough: the code continued into ``_bootstrap``,
+        which re-reads the backup, and in exactly this state the backup is the
+        generation whose grant was just spent. The profile is seeded with a
+        dead refresh token and claude's first refresh gets invalid_grant — the
+        warning scrolls past and the session is broken anyway.
+
+        Refuse instead. The next run's gate pass adopts the stashed successor
+        without consuming anything and bootstraps normally, so the recovery
+        machinery this PR already builds does the rest.
+        """
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+
+        def gate_consumes_then_fails_to_persist(self, num, email, snapshot):
+            # Grant spent; successor NOT written to the backup, which still
+            # holds CREDS, but it DID reach the stash. Exactly the shape
+            # switcher.py returns when the persist fails and the successor is
+            # parked for the next pass.
+            return oauth.RefreshOutcome(
+                ROTATED_CREDS, "transient", stashed=True
+            )
+
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher,
+            "consume_backup_grant",
+            gate_consumes_then_fails_to_persist,
+        )
+
+        with pytest.raises(SessionError, match="stashed — please retry"):
+            manager.setup_session("2", share=False)
+
+        assert seeded_switcher.read_account_credentials(
+            ACCOUNT_NUM, ACCOUNT_EMAIL
+        ) == CREDS, "test premise: the backup still holds the spent generation"
+        # The half the old assertions never covered: what landed in the
+        # PROFILE. A warning that fires while the spent generation is seeded
+        # anyway pins the symptom and misses the defect.
+        seeded = session_dir / ".credentials.json"
+        assert not seeded.exists() or seeded.read_text() != CREDS, (
+            "seeded the profile with the generation whose grant the gate had "
+            "just spent — claude's first refresh gets invalid_grant"
+        )
+
+    def test_an_unpersisted_successor_is_not_reported_as_stashed(
+        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch
+    ):
+        """The `consume-gate-unpersisted` corner needs the OPPOSITE advice.
+
+        There the persist AND the stash both failed, so the successor survived
+        only in the return value the raise discards, and retrying POSTs the
+        spent predecessor — earning a strike. `error` and `credentials` are
+        identical to the stashed shape, so without the gate carrying
+        `stashed` this message promises a stash that never happened and sends
+        the user to retry into a guaranteed invalid_grant.
+        """
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher,
+            "consume_backup_grant",
+            lambda self, num, email, snap: oauth.RefreshOutcome(
+                ROTATED_CREDS, "transient", stashed=False
+            ),
+        )
+
+        with pytest.raises(SessionError) as exc:
+            manager.setup_session("2", share=False)
+
+        msg = str(exc.value)
+        assert "neither be stored nor stashed" in msg
+        assert "Fix the storage failure" in msg
+        assert "the successor is stashed" not in msg, (
+            "promised a stash that never happened"
+        )
+
+
+def test_manifest_interrupted_mid_write_leaves_no_temp(tmp_path: Path, monkeypatch):
+    """The manifest writer swallows OSError on purpose (best effort), but a
+    Ctrl-C must still propagate and must not strand the temp."""
+    from types import SimpleNamespace
+
+    from claude_swap.session import SessionManager
+
+    mgr = SessionManager.__new__(SessionManager)
+    mgr.switcher = SimpleNamespace(platform=object())  # anything but WINDOWS
+
+    def interrupt(fd):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("claude_swap.fsutil.os.fsync", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        mgr._write_manifest(tmp_path / ".cswap-shared.json", ["a"])
+    assert not list(tmp_path.glob("*.tmp"))

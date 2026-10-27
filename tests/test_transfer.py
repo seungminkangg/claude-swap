@@ -14,6 +14,7 @@ import pytest
 
 from claude_swap.exceptions import TransferError
 from claude_swap.models import Platform
+from claude_swap.oauth import credential_fingerprint
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.transfer import export_accounts, import_accounts
 from claude_swap.usage_store import FetchRecord
@@ -591,14 +592,14 @@ class TestValidation:
 
     def test_credentials_garbage_string_rejected(self, temp_home: Path):
         # A non-key string credential is interpreted as an API-key account and
-        # rejected because it isn't a valid sk-ant-api… key.
+        # rejected because it isn't a bare sk-ant-… key.
         s = _linux_switcher(temp_home)
         env = self._make_envelope()
         env["accounts"][0]["credentials"] = "a string"
         f = temp_home / "c.cswap"
         f.write_text(json.dumps(env))
 
-        with pytest.raises(TransferError, match="must be a raw sk-ant-api"):
+        with pytest.raises(TransferError, match="must be a raw sk-ant-"):
             import_accounts(s, str(f))
 
     def test_credentials_non_object_non_string_rejected(self, temp_home: Path):
@@ -739,6 +740,25 @@ class TestFilePermissions:
 
         mode = os.stat(out).st_mode & 0o777
         assert mode == 0o600
+
+    def test_export_onto_a_symlink_replaces_the_link_not_its_target(
+        self, temp_home: Path
+    ):
+        """The destination is user-typed and may sit in a shared directory:
+        a planted link must not redirect the export (refresh tokens) onto
+        another file. The link is replaced; its old target is untouched."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com")
+        decoy = temp_home / "decoy.txt"
+        decoy.write_text("decoy", encoding="utf-8")
+        out = temp_home / "x.cswap"
+        out.symlink_to(decoy)
+
+        export_accounts(s, str(out))
+
+        assert not out.is_symlink()
+        assert '"accounts"' in out.read_text(encoding="utf-8")
+        assert decoy.read_text(encoding="utf-8") == "decoy"
 
     def test_export_temp_file_never_created_world_readable(
         self, temp_home: Path, monkeypatch: pytest.MonkeyPatch
@@ -1078,6 +1098,41 @@ class TestCleanHomeActivation:
                 # Imported config wholesale (the malformed file is replaced)
                 merged = json.loads(config_path.read_text())
                 assert merged["oauthAccount"]["emailAddress"] == "alice@example.com"
+
+    def test_a_valid_empty_config_is_spliced_not_called_unparseable(
+        self, temp_home: Path
+    ):
+        """M-2: `is not None`, not truthiness.
+
+        A valid but EMPTY `{}` config is readable and loses nothing by being
+        spliced. Under a truthiness test it falls to the salvage branch, which
+        copies the file aside and tells the user it "could not be parsed" —
+        the same ""-vs-None conflation this whole PR exists to separate, one
+        level up. The sibling malformed-config test cannot see it: `{not
+        valid json` is genuinely unreadable, so both forms agree there.
+        """
+        src_home = temp_home.parent / "src"
+        src_home.mkdir()
+        export_path = self._seed_and_export(src_home)
+
+        dst_home = temp_home.parent / "dst"
+        dst_home.mkdir()
+        with patch("pathlib.Path.home", return_value=dst_home):
+            with patch.dict(os.environ, {"HOME": str(dst_home)}):
+                dst = _linux_switcher(dst_home)
+                config_path = dst._get_claude_config_path()
+                config_path.write_text("{}")
+
+                import_accounts(dst, str(export_path))
+                with patch.object(dst, "list_accounts"):
+                    dst.switch_to("1")
+
+                merged = json.loads(config_path.read_text())
+                assert merged["oauthAccount"]["emailAddress"] == "alice@example.com"
+                assert not list(config_path.parent.glob("*.unreadable-*")), (
+                    "a valid empty config was salvaged and reported as "
+                    "unparseable"
+                )
 
     def test_active_seeded_when_envelope_active_was_skipped(
         self, temp_home: Path
@@ -1498,6 +1553,41 @@ class TestImportClearsDeadTokenQuarantine:
         creds = s._read_account_credentials("2", "bob@example.com")
         assert json.loads(creds)["_marker"] == "BOB_NEW"
 
+    def test_force_import_of_the_byte_identical_struck_generation_lifts_the_quarantine(
+        self, temp_home: Path
+    ):
+        """Pins issue #218's reporter experiment: the strike is bound to the
+        stored generation's fingerprint (#196 shape) and the forced import
+        carries that exact generation back in, so fingerprint healing can
+        never fire — only transfer.py's explicit clear_dead_token call lifts
+        the verdict. Deleting that call (say, trusting usage_store.py's
+        "heals … without a bespoke clear call" comment) leaves the fp-bound
+        verdict True and fails this test. Pairs with
+        test_import_force_lifts_quarantine, which pins the legacy
+        struckFingerprint-less row shape."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 2, "bob@example.com")
+        ident = {"2": ("bob@example.com", "")}
+        fp = credential_fingerprint(
+            s._read_account_credentials("2", "bob@example.com")
+        )
+        s._usage_store.record(
+            {"2": FetchRecord(error="invalid_grant", struck_fp=fp)}, ident
+        )
+        entry = s._usage_store.entries(ident)["2"]
+        assert entry.struck_fingerprint == fp, "premise: strike is fp-bound"
+        assert entry.token_dead(stored_fp=fp), "premise: verdict holds"
+
+        out = temp_home / "bob.cswap"
+        export_accounts(s, str(out), account="2")
+        # No envelope mutation: re-import exactly the condemned generation.
+        import_accounts(s, str(out), force=True)
+
+        entry = s._usage_store.entries(ident)["2"]
+        assert entry.auth_dead_strikes == 0
+        assert entry.struck_fingerprint is None
+        assert not entry.token_dead(stored_fp=fp)
+
     def test_reimport_after_removal_lifts_orphan_quarantine(
         self, temp_home: Path, capsys
     ):
@@ -1562,6 +1652,164 @@ class TestImportClearsDeadTokenQuarantine:
         assert entry.auth_dead_strikes == 0
         creds = s._read_account_credentials("2", "bob@example.com")
         assert json.loads(creds)["_marker"] == "BOB_HEALED"
+
+    def test_a_healed_strike_does_not_license_a_plain_import_to_replace(
+        self, temp_home: Path, capsys
+    ):
+        """`import_accounts` must consult the helper, not `token_dead()` raw.
+
+        The two new tests in this class both pass against the pre-PR inline
+        expression: one asserts `_slot_token_dead` DIRECTLY without going
+        through `import_accounts`, and in the other the old expression happens
+        to return True as well. So reverting transfer.py's routing to
+        `entries(...)[slot].token_dead()` leaves the suite green and nothing
+        pins that the import asks the collectors' question at all.
+
+        The verdicts differ exactly where the fingerprint binding does its
+        work: a strike bound to a generation the slot no longer stores is
+        HEALED. `entry.token_dead()` with no `stored_fp` still says dead — and
+        a plain import then replaces a healthy slot's credential, which is the
+        whole reason `--force` exists.
+        """
+        from claude_swap import oauth
+
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 2, "bob@example.com")
+        ident = {"2": ("bob@example.com", "")}
+        # Struck on a generation that is NOT what the slot stores now.
+        s._usage_store.record(
+            {"2": FetchRecord(error="invalid_grant",
+                              struck_fp="sha256:someothergeneration")},
+            ident,
+        )
+        # The raw row is dead; the fingerprint-bound question says healed.
+        assert s._usage_store.entries(ident)["2"].token_dead(), (
+            "premise: the unbound verdict, which the pre-PR import used"
+        )
+        stored = s._read_account_credentials("2", "bob@example.com")
+        assert not s._usage_store.entries(ident)["2"].token_dead(
+            stored_fp=oauth.credential_fingerprint(stored)
+        ), "premise: bound to the stored generation, the strike is healed"
+        assert not s._slot_token_dead("2", "bob@example.com")
+
+        out = temp_home / "bob.cswap"
+        export_accounts(s, str(out), account="2")
+        env = json.loads(out.read_text())
+        env["accounts"][0]["credentials"]["_marker"] = "BOB_OVERWRITTEN"
+        out.write_text(json.dumps(env))
+
+        import_accounts(s, str(out), force=False)
+
+        err = capsys.readouterr().err
+        assert "already exists, use --force" in err, (
+            "the import used the unbound verdict, so a slot whose strike the "
+            "fingerprint already healed was replaced without --force"
+        )
+        creds = s._read_account_credentials("2", "bob@example.com")
+        assert json.loads(creds).get("_marker") != "BOB_OVERWRITTEN", (
+            "a healthy slot's credential was overwritten by a plain import"
+        )
+
+    def test_the_heal_finds_the_row_of_an_org_scoped_account(
+        self, temp_home: Path, capsys
+    ):
+        """Every real account carries an organizationUuid.
+
+        _slot_token_dead looked its usage row up with ident={num: (email, "")}.
+        UsageStore._matches requires organizationUuid to be EQUAL, so for any
+        account whose row carries a real org — which is all of them, checked on
+        the live store: three slots, three non-empty uuids — the lookup returns
+        nothing, token_dead() is False, and the import auto-heal it feeds never
+        fires. The slot the user was told to fix with `cswap import` gets
+        "already exists, use --force" instead.
+
+        The previous shape passed entry["org_uuid"] straight through, so this
+        was introduced by routing the check through the shared helper.
+        """
+        s = _linux_switcher(temp_home)
+        ORG = "org-uuid-1234"
+        _seed_account(s, 2, "bob@example.com", org_uuid=ORG)
+        ident = {"2": ("bob@example.com", ORG)}
+        s._usage_store.record({"2": FetchRecord(error="invalid_grant")}, ident)
+        assert s._usage_store.entries(ident)["2"].token_dead()
+
+        assert s._slot_token_dead("2", "bob@example.com"), (
+            "the row lookup passes an empty organizationUuid, so an "
+            "org-scoped account's quarantine is invisible to the import heal"
+        )
+
+    def test_import_heals_an_active_slot_struck_on_its_live_generation(
+        self, temp_home: Path, capsys
+    ):
+        """The heal must ask the same question the collectors ask.
+
+        _entry_token_dead treats an ACTIVE slot as having TWO stored sources:
+        the live credential and the backup. A strike holds while EITHER still
+        matches the struck generation, because _fetch_active_usage's recovery
+        branch legitimately POSTs the backup while ordinary passes POST the
+        live bytes.
+
+        The import heal compares only against the backup. So when the strike is
+        bound to the LIVE generation and the backup has since moved, the
+        collectors correctly read the slot as quarantined while the import
+        reads it as healthy and refuses to replace it — and `cswap import` is
+        exactly what the "re-login needed" message tells the user to run.
+        """
+        from claude_swap import oauth
+
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 2, "bob@example.com")
+        ident = {"2": ("bob@example.com", "")}
+
+        live = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live", "refreshToken": "rt-live",
+            "expiresAt": 9999999999000}})
+        newer_backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-bk", "refreshToken": "rt-bk",
+            "expiresAt": 9999999999000}})
+        # Slot 2 is ACTIVE and its live bytes are what got struck; the backup
+        # has since been rewritten to a different lineage.
+        # current_account_number() resolves the active slot from the LIVE
+        # login's identity in .claude.json, not from activeAccountNumber.
+        cfg = s._get_claude_config_path()
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        s._write_json(cfg, {"oauthAccount": {
+            "emailAddress": "bob@example.com",
+            "accountUuid": "acct-2",
+            "organizationUuid": "",
+            "organizationName": "",
+        }})
+        s._store._write_active_credentials_file(live)
+        s._write_account_credentials("2", "bob@example.com", newer_backup)
+        s._usage_store.record(
+            {"2": FetchRecord(
+                error="invalid_grant",
+                struck_fp=oauth.credential_fingerprint(live),
+            )},
+            ident,
+        )
+
+        out = temp_home / "bob.cswap"
+        export_accounts(s, str(out), account="2")
+        env = json.loads(out.read_text())
+        env["accounts"][0]["credentials"]["_marker"] = "BOB_HEALED"
+        out.write_text(json.dumps(env))
+
+        # Probe the verdict itself before the import, so a failure names
+        # which half is wrong.
+        assert s.current_account_number() == "2"
+        assert s._slot_token_dead("2", "bob@example.com"), (
+            "the strike is bound to the live generation and slot 2 is active, "
+            "so the collectors' rule says dead"
+        )
+
+        import_accounts(s, str(out), force=False)
+
+        err = capsys.readouterr().err
+        assert "was quarantined: refresh token dead" in err, (
+            "the import compared the strike only against the backup, so an "
+            "active slot struck on its live generation is never healed"
+        )
 
     def test_plain_import_skips_healthy_slot(self, temp_home: Path, capsys):
         """The heal is scoped to token_dead() only: a healthy existing account
@@ -1678,3 +1926,301 @@ class TestImportClearsDeadTokenQuarantine:
                 )[slot]
                 assert not entry.token_dead()
                 assert entry.auth_dead_strikes == 0
+
+
+class TestForceOverwriteNarratesTheStrikeClear:
+    """A forced overwrite of a slot whose row holds a dead-token strike must
+    say the strike was cleared — and, when the imported bytes carry the very
+    refresh-token generation the strike condemned, say the re-test can
+    honestly re-condemn it. Issue #218: the silent lift → poll → re-strike
+    cycle read exactly like "the clear never happened"."""
+
+    def test_force_overwrite_names_the_same_condemned_generation(
+        self, temp_home: Path, capsys
+    ):
+        """Byte-identical re-import of the struck generation prints both the
+        clear line and the same-generation candor note. Killed mutations:
+        dropping the narration, and fingerprinting the wrong side of the
+        comparison (the omits-test pins the other direction)."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 2, "bob@example.com")
+        ident = {"2": ("bob@example.com", "")}
+        fp = credential_fingerprint(
+            s._read_account_credentials("2", "bob@example.com")
+        )
+        s._usage_store.record(
+            {"2": FetchRecord(error="invalid_grant", struck_fp=fp)}, ident
+        )
+
+        out = temp_home / "bob.cswap"
+        export_accounts(s, str(out), account="2")
+        import_accounts(s, str(out), force=True)
+
+        err = capsys.readouterr().err
+        assert "Overwrote bob@example.com (slot 2)" in err
+        assert "cleared this slot's stored dead-token strike" in err
+        assert "same credential generation" in err
+
+    def test_force_overwrite_with_a_newer_generation_omits_the_generation_note(
+        self, temp_home: Path, capsys
+    ):
+        """A rotated refresh token in the envelope is a different generation:
+        the clear line still prints, the candor note must not."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 2, "bob@example.com")
+        ident = {"2": ("bob@example.com", "")}
+        fp = credential_fingerprint(
+            s._read_account_credentials("2", "bob@example.com")
+        )
+        s._usage_store.record(
+            {"2": FetchRecord(error="invalid_grant", struck_fp=fp)}, ident
+        )
+
+        out = temp_home / "bob.cswap"
+        export_accounts(s, str(out), account="2")
+        env = json.loads(out.read_text())
+        env["accounts"][0]["credentials"]["refreshToken"] = "rtok-2-rotated"
+        out.write_text(json.dumps(env))
+        import_accounts(s, str(out), force=True)
+
+        err = capsys.readouterr().err
+        assert "cleared this slot's stored dead-token strike" in err
+        assert "same credential generation" not in err
+
+    def test_force_overwrite_narrates_only_the_struck_account(
+        self, temp_home: Path, capsys
+    ):
+        """Two accounts forced in one run, only the first struck: exactly one
+        clear line. Kills both an unconditional print and per-iteration state
+        leaking from the struck account into the healthy one."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 2, "bob@example.com")
+        _seed_account(s, 3, "carol@example.com")
+        s._usage_store.record(
+            {"2": FetchRecord(error="invalid_grant")},
+            {"2": ("bob@example.com", "")},
+        )
+
+        out = temp_home / "both.cswap"
+        export_accounts(s, str(out))
+        import_accounts(s, str(out), force=True)
+
+        err = capsys.readouterr().err
+        assert "Overwrote bob@example.com (slot 2)" in err
+        assert "Overwrote carol@example.com (slot 3)" in err
+        assert err.count("cleared this slot's stored dead-token strike") == 1
+
+    def test_force_overwrite_narrates_a_condemned_generation_without_a_refresh_token(
+        self, temp_home: Path, capsys
+    ):
+        """no_refresh_token strikes are fingerprint-bound too — by content
+        hash, since the condemned blob has no refresh token — so the candor
+        note must not claim a "refresh-token generation" or predict
+        invalid_grant specifically. Pins the generic wording for the
+        non-invalid_grant strike class."""
+        s = _linux_switcher(temp_home)
+        creds = {"accessToken": "tok-1", "expiresAt": 9999}
+        _seed_account(s, 2, "bob@example.com", creds=creds)
+        ident = {"2": ("bob@example.com", "")}
+        fp = credential_fingerprint(
+            s._read_account_credentials("2", "bob@example.com")
+        )
+        assert fp is not None and fp.startswith("sha256-full:"), (
+            "premise: a refresh-token-less blob fingerprints by content"
+        )
+        s._usage_store.record(
+            {"2": FetchRecord(error="no_refresh_token", struck_fp=fp)}, ident
+        )
+
+        out = temp_home / "bob.cswap"
+        export_accounts(s, str(out), account="2")
+        import_accounts(s, str(out), force=True)
+
+        err = capsys.readouterr().err
+        assert "cleared this slot's stored dead-token strike" in err
+        assert "same credential generation" in err
+        assert "invalid_grant" not in err
+        assert "refresh-token generation" not in err
+
+
+# ---------------------------------------------------------------------------
+# import-usage
+# ---------------------------------------------------------------------------
+
+def _live_creds(tag: str) -> dict:
+    """A backup whose token is valid (far-future expiry), so it goes straight
+    to the usage request (patched), never through a refresh. Distinct per
+    account: two slots holding one credential read as a duplicate login."""
+    return {"claudeAiOauth": {
+        "accessToken": f"tok-{tag}",
+        "refreshToken": f"rtok-{tag}",
+        "expiresAt": 4_102_444_800_000,
+    }}
+
+
+def _usage_row(email: str, org_uuid: str = "", pct: float = 42.0, age_s: float = 30.0) -> dict:
+    """An account row as another machine's ``cswap list --json`` prints it.
+
+    Slot 9 on purpose: rows are matched by identity, never by the producer's
+    slot number."""
+    import time
+
+    from claude_swap.json_output import account_row
+
+    return account_row(
+        9, email, "", org_uuid, False,
+        {"five_hour": {"pct": pct, "resets_at": "2099-01-01T00:00:00+00:00"}},
+        usage_fetched_at=time.time() - age_s,
+        usage_age_s=age_s,
+    )
+
+
+def _usage_document(*rows: dict) -> str:
+    return json.dumps(
+        {"schemaVersion": 1, "activeAccountNumber": None, "accounts": list(rows)}
+    )
+
+
+class TestImportUsage:
+    def _import(self, switcher, home: Path, document: str, hold_s: float | None = None):
+        from claude_swap.transfer import import_usage
+
+        path = home / "usage.json"
+        path.write_text(document, encoding="utf-8")
+        import_usage(switcher, str(path), hold_s=hold_s)
+
+    def test_rows_are_matched_by_identity(self, temp_home: Path, capsys):
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com", "org-a")
+        _seed_account(s, 2, "bob@example.com")
+        unavailable = {
+            "email": "alice@example.com", "organizationUuid": "org-a",
+            "usageStatus": "unavailable", "usage": None,
+        }
+        self._import(s, temp_home, _usage_document(
+            _usage_row("bob@example.com", pct=42.0),
+            _usage_row("stranger@example.com"),
+            unavailable,
+        ))
+
+        entries = s._usage_store.entries({
+            "1": ("alice@example.com", "org-a"), "2": ("bob@example.com", ""),
+        })
+        assert entries["2"].last_good["five_hour"]["pct"] == 42.0
+        assert entries["2"].age_s == pytest.approx(30.0, abs=5)
+        assert entries["1"].last_good is None
+        err = capsys.readouterr().err
+        assert "Adopted usage for bob@example.com → slot 2" in err
+        assert "Done: 1 adopted, 0 kept, 2 skipped" in err
+
+    def test_a_held_account_is_not_fetched(self, temp_home: Path):
+        """Through the real collector: after a hand-over with a hold,
+        ``list --json`` serves the adopted reading and sends no request for
+        that account, while an account nobody handed over is fetched as
+        usual."""
+        from claude_swap import oauth
+
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com", creds=_live_creds("alice"))
+        _seed_account(s, 2, "bob@example.com", creds=_live_creds("bob"))
+        self._import(
+            s, temp_home,
+            _usage_document(_usage_row("bob@example.com", pct=42.0, age_s=400.0)),
+            hold_s=600.0,
+        )
+
+        fetched: list[str] = []
+
+        def fake_fetch(num, email, creds, **kwargs):
+            fetched.append(email)
+            return oauth.UsageOutcome({"five_hour": {"pct": 1.0}})
+
+        with patch("claude_swap.oauth.try_fetch_usage_for_account", side_effect=fake_fetch):
+            payload = s.list_accounts(json_output=True)
+
+        assert fetched == ["alice@example.com"], payload
+        bob = next(a for a in payload["accounts"] if a["email"] == "bob@example.com")
+        # 400s is past STALE_OK_S: the hold is what keeps it decision-grade.
+        assert bob["usageStatus"] == "ok"
+        assert bob["usage"]["fiveHour"]["pct"] == 42.0
+
+    def test_a_zero_hold_hands_the_account_back(self, temp_home: Path, capsys):
+        """``--hold 0`` lifts the hold an earlier hand-over set, so the next
+        collector fetches the account itself instead of waiting it out."""
+        from claude_swap import oauth
+
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com", creds=_live_creds("alice"))
+        document = _usage_document(_usage_row("alice@example.com", age_s=400.0))
+        self._import(s, temp_home, document, hold_s=600.0)
+        self._import(s, temp_home, document, hold_s=0.0)
+        assert "holds lifted" in capsys.readouterr().err
+
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            return_value=oauth.UsageOutcome({"five_hour": {"pct": 1.0}}),
+        ) as fetch:
+            s.list_accounts(json_output=True)
+        fetch.assert_called_once()
+
+    def test_a_held_active_account_shows_its_reading_not_token_expired(
+        self, temp_home: Path
+    ):
+        """An expired active token reads token_expired until the fetch path
+        refreshes it. A held slot is not waiting on that fetch — the reading
+        it was handed is current — so the row shows the reading."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com")
+        (temp_home / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": "alice@example.com", "accountUuid": "acct-1"}}
+        ))
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "tok", "refreshToken": "rtok", "expiresAt": 1000}}
+        ))
+        self._import(
+            s, temp_home, _usage_document(_usage_row("alice@example.com", pct=42.0)),
+            hold_s=600.0,
+        )
+
+        with patch("claude_swap.oauth.try_fetch_usage_for_account") as fetch:
+            payload = s.list_accounts(json_output=True)
+
+        fetch.assert_not_called()
+        (row,) = payload["accounts"]
+        assert row["active"] is True
+        assert row["usageStatus"] == "ok"
+        assert row["usage"]["fiveHour"]["pct"] == 42.0
+
+    def test_reads_stdin(self, temp_home: Path, monkeypatch):
+        from claude_swap.transfer import import_usage
+
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com")
+        monkeypatch.setattr(
+            sys, "stdin", io.StringIO(_usage_document(_usage_row("alice@example.com")))
+        )
+        import_usage(s, "-")
+        entry = s._usage_store.entries({"1": ("alice@example.com", "")})["1"]
+        assert entry.last_good is not None
+
+    @pytest.mark.parametrize("document,message", [
+        ('{"schemaVersion": 2, "accounts": []}', "unsupported usage document schemaVersion"),
+        ('{"schemaVersion": 1}', "no accounts list"),
+        ("[]", "must be a JSON object"),
+    ])
+    def test_malformed_document_is_refused(self, temp_home: Path, document, message):
+        s = _linux_switcher(temp_home)
+        with pytest.raises(TransferError, match=message):
+            self._import(s, temp_home, document)
+
+    def test_a_bad_row_writes_nothing(self, temp_home: Path):
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com")
+        _seed_account(s, 2, "bob@example.com")
+        bad = _usage_row("bob@example.com")
+        bad["usageAgeSeconds"] = -5
+        with pytest.raises(TransferError, match="usageAgeSeconds for bob@example.com"):
+            self._import(
+                s, temp_home, _usage_document(_usage_row("alice@example.com"), bad)
+            )
+        assert not s._usage_store.path.exists()
