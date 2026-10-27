@@ -524,9 +524,15 @@ class SessionManager:
     # -- bootstrap -------------------------------------------------------
 
     def setup_session(
-        self, identifier: str, share: bool, share_history: bool = False
+        self, identifier: str, share: bool | None, share_history: bool = False
     ) -> tuple[Path, str, str]:
-        """Ensure a valid session profile exists; returns (dir, num, email)."""
+        """Ensure a valid session profile exists; returns (dir, num, email).
+
+        ``share=None`` preserves the profile's existing sharing state.  It is
+        reserved for read-only helpers such as the setup-token usage probe;
+        interactive ``run`` calls always pass a bool and continue to apply the
+        user's requested sharing flags.
+        """
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
         # Defense-in-depth: also guard here (run() guards before its fast path).
         self._ensure_not_api_key(account_num, email)
@@ -543,7 +549,8 @@ class SessionManager:
 
         # Cheap reuse check without the lock: most launches hit this.
         if not stale and self._is_session_valid(session_dir, email, org_uuid):
-            self._sync_sharing(session_dir, share, share_history)
+            if share is not None:
+                self._sync_sharing(session_dir, share, share_history)
             return session_dir, account_num, email
 
         with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
@@ -555,11 +562,13 @@ class SessionManager:
                 self.switcher._invalidate_session_credentials(account_num, email)
                 (session_dir / STALE_MARKER).unlink(missing_ok=True)
             if self._is_session_valid(session_dir, email, org_uuid):
-                self._sync_sharing(session_dir, share, share_history)
+                if share is not None:
+                    self._sync_sharing(session_dir, share, share_history)
                 return session_dir, account_num, email
 
             self._bootstrap(session_dir, account_num, email, org_uuid)
-            self._sync_sharing(session_dir, share, share_history)
+            if share is not None:
+                self._sync_sharing(session_dir, share, share_history)
 
             if not self._is_session_valid(session_dir, email, org_uuid):
                 self._cleanup_failed_session(session_dir)

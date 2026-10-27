@@ -3389,6 +3389,27 @@ class ClaudeAccountSwitcher:
         """One network fetch for one account. Never raises."""
         num, email, _, org_uuid, is_active, creds, _alias = account_info
 
+        # Setup-tokens only carry user:inference.  The OAuth usage endpoint
+        # therefore rejects them with 403; retrying that path also burns the
+        # endpoint's request budget and turns the failure into 429.  Ask the
+        # official Claude Code client for the same built-in /usage view instead.
+        if oauth.is_setup_token_credentials(creds):
+            try:
+                from claude_swap.session import SessionManager
+                from claude_swap.setup_token_usage import fetch_setup_token_usage
+
+                session_dir, _, _ = SessionManager(self).setup_session(
+                    str(num), share=None
+                )
+                return FetchRecord(usage=fetch_setup_token_usage(session_dir))
+            except Exception:
+                self._logger.warning(
+                    "Setup-token usage probe failed for account %s; backing off.",
+                    num,
+                    exc_info=True,
+                )
+                return FetchRecord(error="setup-token-usage-unavailable")
+
         # The active/default account owns the live credential — route it
         # through the locked-refresh path (refreshes an expired token under
         # Claude Code's own lock protocol, owner or not).
