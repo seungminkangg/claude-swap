@@ -5214,7 +5214,10 @@ class ClaudeAccountSwitcher:
         # therefore rejects them with 403; retrying that path also burns the
         # endpoint's request budget and turns the failure into 429.  Ask the
         # official Claude Code client for the same built-in /usage view instead.
-        if oauth.is_setup_token_credentials(creds):
+        # With usage.headerProbe on, upstream's header probe owns these rows;
+        # if /usage fails, fall through to upstream's setup-token handling.
+        if (oauth.is_setup_token_credentials(creds)
+                and not self._header_probe_enabled()):
             try:
                 from claude_swap.session import SessionManager
                 from claude_swap.setup_token_usage import fetch_setup_token_usage
@@ -5225,11 +5228,10 @@ class ClaudeAccountSwitcher:
                 return FetchRecord(usage=fetch_setup_token_usage(session_dir))
             except Exception:
                 self._logger.warning(
-                    "Setup-token usage probe failed for account %s; backing off.",
+                    "Setup-token /usage probe failed for account %s.",
                     num,
                     exc_info=True,
                 )
-                return FetchRecord(error="setup-token-usage-unavailable")
 
         # The active/default account owns the live credential — route it
         # through the locked-refresh path (refreshes an expired token under
